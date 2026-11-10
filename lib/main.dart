@@ -1,6 +1,7 @@
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 
+import 'app_info.dart';
 import 'firebase_options.dart';
 import 'screens/score_screen.dart';
 
@@ -16,7 +17,7 @@ class SoftTennisApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'ソフトテニス スコア',
+      title: appName,
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,

@@ -1,15 +1,16 @@
 import 'dart:async';
 
-import 'club_list_screen.dart';
-import '../models/match_info.dart';
-import '../data/match_repository.dart';
-import '../models/player_names.dart';
-import 'names_dialog.dart';
-
 import 'package:flutter/material.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 
+import '../app_info.dart';
+import '../data/match_repository.dart';
 import '../logic/tennis_rule.dart';
+import '../models/match_info.dart';
 import '../models/match_state.dart';
+import '../models/player_names.dart';
+import 'club_list_screen.dart';
+import 'names_dialog.dart';
 
 class ScoreScreen extends StatefulWidget {
   const ScoreScreen({super.key});
@@ -18,31 +19,89 @@ class ScoreScreen extends StatefulWidget {
   State<ScoreScreen> createState() => _ScoreScreenState();
 }
 
-class _ScoreScreenState extends State<ScoreScreen> {
+class _ScoreScreenState extends State<ScoreScreen> with WidgetsBindingObserver {
   static const Color _colorA = Color(0xFF1565C0);
   static const Color _colorB = Color(0xFFC62828);
 
+  final _repo = FirestoreMatchRepository();
+
   MatchState _state = const MatchState();
   final List<MatchState> _undoStack = [];
-
-  final _repo = FirestoreMatchRepository();
   PlayerNames _names = PlayerNames.defaults();
   MatchInfo _info = const MatchInfo();
+
   String? _matchId; // null = ローカルのみ
-  bool _readOnly = false; // true = 閲覧専用（オーナーではない）
+  bool _readOnly = false; // true = 閲覧専用
   StreamSubscription<MatchSnapshot?>? _sub;
 
+  bool _keepAwake = true; // 画面を消さない
+  bool _wakeHeld = false;
+
+  Color _teamColor(Team t) => t == Team.a ? _colorA : _colorB;
   bool get _locked => _state.isOver || _readOnly;
+
+  // ============================================================
+  // ライフサイクル・画面スリープ防止
+  // ============================================================
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _applyWakelock();
+  }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _sub?.cancel();
+    WakelockPlus.disable().catchError((_) {});
     super.dispose();
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // ブラウザは、画面を離れるとロックを自動で解除するので、戻ったら取り直す
+    if (state == AppLifecycleState.resumed) {
+      _wakeHeld = false;
+      _applyWakelock();
+    }
+  }
+
+  Future<void> _applyWakelock() async {
+    try {
+      if (_keepAwake) {
+        await WakelockPlus.enable();
+        _wakeHeld = true;
+      } else {
+        await WakelockPlus.disable();
+        _wakeHeld = false;
+      }
+    } catch (_) {
+      _wakeHeld = false; // 非対応の環境では何もしない
+    }
+  }
+
+  void _toggleKeepAwake() {
+    setState(() => _keepAwake = !_keepAwake);
+    _applyWakelock();
+    _toast(_keepAwake ? '画面を消さない：オン' : '画面を消さない：オフ');
+  }
+
+  /// 操作のたびに、ロックが外れていれば取り直す（ブラウザは操作時の要求を通しやすい）
+  void _ensureWakelock() {
+    if (_keepAwake && !_wakeHeld) _applyWakelock();
+  }
+
+  // ============================================================
+  // 共通
+  // ============================================================
+
   void _toast(String msg) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(msg)));
   }
 
   /// クラウドへ書き込み（await しない。圏外でも端末内にキューされる）
@@ -54,9 +113,134 @@ class _ScoreScreenState extends State<ScoreScreen> {
     });
   }
 
-  // ---------- 試合情報・ペア名 ----------
-  Future<void> _editSetup() async {
+  // ============================================================
+  // 試合の操作
+  // ============================================================
+
+  void _apply(MatchState next) {
+    if (_readOnly || identical(next, _state)) return;
+    _ensureWakelock();
+    setState(() {
+      _undoStack.add(_state);
+      _state = next;
+    });
+    _push();
+  }
+
+  void _score(Player p) => _apply(TennisRule.scoreBy(_state, p));
+  void _miss(Player p) => _apply(TennisRule.errorBy(_state, p));
+  void _serve(ServeResult r) => _apply(TennisRule.recordFirstServe(_state, r));
+
+  void _undo() {
+    if (_readOnly || _undoStack.isEmpty) return;
+    _ensureWakelock();
+    setState(() => _state = _undoStack.removeLast());
+    _push();
+  }
+
+  Future<void> _confirmReset() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('試合リセット'),
+        content: Text(
+          _matchId == null
+              ? 'スコアをすべて消去して、最初からやり直しますか？'
+              : 'スコアをすべて消去します。クラウド上のこの試合も初期化されます。\n\n'
+                    '次の試合に進むときは、「次の試合へ」を使うと、この試合の記録を残せます。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('リセット'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      setState(() {
+        _state = const MatchState();
+        _undoStack.clear();
+      });
+      _push();
+    }
+  }
+
+  /// 次の試合へ：今の試合は（クラウド接続中なら）そのまま残し、新しい試合を始める
+  Future<void> _nextMatch() async {
     if (_readOnly) return;
+
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('次の試合へ'),
+        content: Text(
+          [
+            if (!_state.isOver) '※この試合はまだ終了していません。\n',
+            if (_matchId == null)
+              'この試合の記録は消えます（クラウドに保存していません）。'
+            else
+              '今の試合（コード: $_matchId）はクラウドに残ります。新しい試合コードを発行します。',
+            '\n大会名・日付・会場・所属は引き継ぎます。選手名とスコアは初期化されます。',
+          ].join('\n'),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('キャンセル'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('次の試合へ'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    const fresh = MatchState();
+    final nextInfo = MatchInfo(
+      title: _info.title,
+      date: _info.date,
+      venue: _info.venue,
+    );
+    final nextNames = PlayerNames.defaults()
+        .setAffiliation(Team.a, _names.affiliation(Team.a))
+        .setAffiliation(Team.b, _names.affiliation(Team.b));
+
+    String? newId;
+    if (_matchId != null) {
+      try {
+        newId = await _repo.createMatch(fresh, nextNames, nextInfo);
+      } catch (e) {
+        _toast('新しい試合の作成に失敗しました: $e');
+        return; // 失敗したときは、今の試合をそのまま残す
+      }
+    }
+    if (!mounted) return;
+
+    setState(() {
+      _state = fresh;
+      _undoStack.clear();
+      _names = nextNames;
+      _info = nextInfo;
+      if (newId != null) _matchId = newId;
+    });
+    if (newId != null) _toast('新しい試合コード: $newId');
+
+    await _editSetup(); // 続けて、ペア名などを入力
+  }
+
+  // ============================================================
+  // 試合情報・ペア名・サーブ順
+  // ============================================================
+
+  Future<void> _editSetup() async {
+    if (_readOnly || !mounted) return;
     final r = await showDialog<MatchSetup>(
       context: context,
       builder: (_) => MatchSetupDialog(info: _info, names: _names),
@@ -69,83 +253,89 @@ class _ScoreScreenState extends State<ScoreScreen> {
     _push();
   }
 
-  Widget _buildInfoHeader() {
-    final i = _info;
-    if (i.isEmpty && _readOnly) return const SizedBox.shrink();
+  Future<void> _editServeOrder() async {
+    var first = _state.serveOrder[0];
+    var other = _state.serveOrder[1];
 
-    final line2 = [
-      if (i.dateText.isNotEmpty) i.dateText,
-      if (i.venue.isNotEmpty) i.venue,
-    ].join('　');
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          Widget chips(
+            List<Player> options,
+            Player selected,
+            ValueChanged<Player> onSelect,
+          ) {
+            return Wrap(
+              spacing: 8,
+              children: [
+                for (final p in options)
+                  ChoiceChip(
+                    label: Text(_names.of(p)),
+                    selected: p == selected,
+                    onSelected: (_) => setLocal(() => onSelect(p)),
+                  ),
+              ],
+            );
+          }
 
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(8),
-        onTap: _readOnly ? null : _editSetup,
-        child: Container(
-          width: double.infinity,
-          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: Colors.grey.shade300),
-          ),
-          child: i.isEmpty
-              ? Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(
-                      Icons.edit_note,
-                      size: 18,
-                      color: Colors.grey.shade600,
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      '試合情報・ペア名を入力（大会名・所属・選手名など）',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: Colors.grey.shade600,
-                      ),
-                    ),
-                  ],
-                )
-              : Column(
-                  children: [
-                    if (i.title.isNotEmpty)
-                      Text(
-                        i.title,
-                        textAlign: TextAlign.center,
-                        style: const TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    if (line2.isNotEmpty)
-                      Text(
-                        line2,
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey.shade700,
-                        ),
-                      ),
-                    if (i.note.isNotEmpty)
-                      Text(
-                        i.note,
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: Colors.grey.shade600,
-                        ),
-                      ),
-                  ],
+          return AlertDialog(
+            title: const Text('サーブ順の設定'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  '最初にサーブを打つ選手',
+                  style: TextStyle(fontWeight: FontWeight.bold),
                 ),
-        ),
+                const SizedBox(height: 6),
+                chips(Player.values, first, (p) {
+                  first = p;
+                  if (other.team == first.team) {
+                    other = Player.of(first.team.other).first;
+                  }
+                }),
+                const SizedBox(height: 16),
+                const Text(
+                  '相手ペアで最初に打つ選手',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 6),
+                chips(Player.of(first.team.other), other, (p) => other = p),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('キャンセル'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('決定'),
+              ),
+            ],
+          );
+        },
       ),
     );
+
+    if (ok == true) {
+      setState(() {
+        _state = TennisRule.setServeOrder(
+          _state,
+          firstServer: first,
+          otherPairFirst: other,
+        );
+      });
+      _push();
+    }
   }
 
-  // ---------- クラウド ----------
+  // ============================================================
+  // クラウド
+  // ============================================================
+
   Future<void> _openCloudMenu() async {
     final action = await showModalBottomSheet<String>(
       context: context,
@@ -191,10 +381,10 @@ class _ScoreScreenState extends State<ScoreScreen> {
         await _createCloudMatch();
       case 'join':
         await _joinCloudMatch();
-      case 'leave':
-        _disconnect();
       case 'club':
         await _openClubList();
+      case 'leave':
+        _disconnect();
     }
   }
 
@@ -223,7 +413,6 @@ class _ScoreScreenState extends State<ScoreScreen> {
     await _joinWithCode(code);
   }
 
-  /// 一覧画面を開き、選ばれた試合に参加する
   Future<void> _openClubList() async {
     final code = await Navigator.push<String>(
       context,
@@ -275,157 +464,71 @@ class _ScoreScreenState extends State<ScoreScreen> {
     });
   }
 
-  Widget _buildCloudBanner() {
-    if (_matchId == null) return const SizedBox.shrink();
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.only(bottom: 6),
-      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 10),
-      decoration: BoxDecoration(
-        color: _readOnly ? Colors.amber.shade100 : Colors.green.shade100,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Text(
-        _readOnly ? '閲覧中（読み取り専用）　コード: $_matchId' : '入力中（クラウド同期）　コード: $_matchId',
-        textAlign: TextAlign.center,
-        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-      ),
-    );
-  }
-
-  Color _teamColor(Team t) => t == Team.a ? _colorA : _colorB;
-
   // ============================================================
-  // 操作
+  // このアプリについて
   // ============================================================
 
-  /// 新しい状態に更新する。変化がなければ何もしない（Undoにも積まない）。
-  void _apply(MatchState next) {
-    if (_readOnly || identical(next, _state)) return;
-    setState(() {
-      _undoStack.add(_state);
-      _state = next;
-    });
-    _push();
-  }
-
-  void _score(Player p) => _apply(TennisRule.scoreBy(_state, p));
-  void _miss(Player p) => _apply(TennisRule.errorBy(_state, p));
-  void _serve(ServeResult r) => _apply(TennisRule.recordFirstServe(_state, r));
-
-  void _undo() {
-    if (_readOnly || _undoStack.isEmpty) return;
-    setState(() => _state = _undoStack.removeLast());
-    _push();
-  }
-
-  Future<void> _confirmReset() async {
-    final ok = await showDialog<bool>(
+  void _showAbout() {
+    showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('試合リセット'),
-        content: const Text('すべて消去して最初からやり直しますか？'),
+        title: const Text('このアプリについて'),
+        content: SizedBox(
+          width: 420,
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '$appName $appVersion',
+                  style: const TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  appDescription,
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  '開発：$appPublisher',
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                ),
+                const Divider(height: 24),
+                const Text(
+                  '更新履歴',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                for (final r in releaseNotes) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    r.version,
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  for (final line in r.items)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        '・$line',
+                        style: const TextStyle(fontSize: 13),
+                      ),
+                    ),
+                ],
+              ],
+            ),
+          ),
+        ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('キャンセル'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('リセット'),
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('閉じる'),
           ),
         ],
       ),
     );
-    if (ok == true) {
-      setState(() {
-        _state = const MatchState();
-        _undoStack.clear();
-      });
-      _push();
-    }
-  }
-
-  /// サーブ順の設定（試合開始前のみ）
-  Future<void> _editServeOrder() async {
-    var first = _state.serveOrder[0]; // 最初にサーブを打つ選手
-    var other = _state.serveOrder[1]; // 相手ペアで最初に打つ選手
-
-    final ok = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setLocal) {
-          Widget chips(
-            List<Player> options,
-            Player selected,
-            ValueChanged<Player> onSelect,
-          ) {
-            return Wrap(
-              spacing: 8,
-              children: [
-                for (final p in options)
-                  ChoiceChip(
-                    label: Text(_names.of(p)),
-                    selected: p == selected,
-                    onSelected: (_) => setLocal(() => onSelect(p)),
-                  ),
-              ],
-            );
-          }
-
-          return AlertDialog(
-            title: const Text('サーブ順の設定'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text(
-                  '最初にサーブを打つ選手',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 6),
-                chips(Player.values, first, (p) {
-                  first = p;
-                  // 相手ペアの選手が first と同じペアにならないよう調整
-                  if (other.team == first.team) {
-                    other = Player.of(first.team.other).first;
-                  }
-                }),
-                const SizedBox(height: 16),
-                const Text(
-                  '相手ペアで最初に打つ選手',
-                  style: TextStyle(fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 6),
-                chips(Player.of(first.team.other), other, (p) => other = p),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.pop(ctx, false),
-                child: const Text('キャンセル'),
-              ),
-              FilledButton(
-                onPressed: () => Navigator.pop(ctx, true),
-                child: const Text('決定'),
-              ),
-            ],
-          );
-        },
-      ),
-    );
-
-    if (ok == true) {
-      // 試合開始前の設定なので Undo には積まない
-      setState(() {
-        _state = TennisRule.setServeOrder(
-          _state,
-          firstServer: first,
-          otherPairFirst: other,
-        );
-      });
-      _push();
-    }
   }
 
   // ============================================================
@@ -434,48 +537,176 @@ class _ScoreScreenState extends State<ScoreScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('スコアシート ver1.0'),
-        centerTitle: true,
-        actions: [
-          IconButton(
-            tooltip: '試合情報・ペア名',
-            icon: const Icon(Icons.edit_note),
-            onPressed: _readOnly ? null : _editSetup,
+    return DefaultTabController(
+      length: 2,
+      child: Scaffold(
+        appBar: AppBar(
+          title: Text(
+            '$appName $appVersion',
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(fontSize: 18),
           ),
-          IconButton(
-            tooltip: 'クラウド同期',
-            icon: Icon(_matchId == null ? Icons.cloud_off : Icons.cloud_done),
-            onPressed: _openCloudMenu,
-          ),
-          if (_state.isPristine && !_readOnly)
+          actions: [
             IconButton(
-              tooltip: 'サーブ順',
-              icon: const Icon(Icons.swap_horiz),
-              onPressed: _editServeOrder,
+              tooltip: '試合情報・ペア名',
+              icon: const Icon(Icons.edit_note),
+              onPressed: _readOnly ? null : _editSetup,
             ),
+            IconButton(
+              tooltip: 'クラウド同期',
+              icon: Icon(_matchId == null ? Icons.cloud_off : Icons.cloud_done),
+              onPressed: _openCloudMenu,
+            ),
+            PopupMenuButton<String>(
+              tooltip: 'メニュー',
+              onSelected: (v) {
+                switch (v) {
+                  case 'serve':
+                    _editServeOrder();
+                  case 'awake':
+                    _toggleKeepAwake();
+                  case 'about':
+                    _showAbout();
+                }
+              },
+              itemBuilder: (_) => [
+                PopupMenuItem<String>(
+                  value: 'serve',
+                  enabled: _state.isPristine && !_readOnly,
+                  child: const Text('サーブ順を設定（試合開始前のみ）'),
+                ),
+                CheckedPopupMenuItem<String>(
+                  value: 'awake',
+                  checked: _keepAwake,
+                  child: const Text('画面を消さない'),
+                ),
+                const PopupMenuItem<String>(
+                  value: 'about',
+                  child: Text('このアプリについて'),
+                ),
+              ],
+            ),
+          ],
+          bottom: const TabBar(
+            tabs: [
+              Tab(text: '入力'),
+              Tab(text: 'スタッツ・履歴'),
+            ],
+          ),
+        ),
+        body: SafeArea(
+          child: TabBarView(
+            // 入力中の横スワイプで、タブが切り替わらないようにする
+            physics: const NeverScrollableScrollPhysics(),
+            children: [_buildInputTab(), _buildStatsTab()],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ---------- タブ1：入力 ----------
+  Widget _buildInputTab() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.fromLTRB(12, 6, 12, 12),
+      child: Column(
+        children: [
+          _buildCloudBanner(),
+          _buildInfoHeader(),
+          _buildGameCount(),
+          _buildGameHistory(),
+          _buildPoints(),
+          const SizedBox(height: 6),
+          _buildServeButtons(),
+          const SizedBox(height: 6),
+          _buildPlayerButtons(),
+          const SizedBox(height: 6),
+          _buildUtilButtons(),
         ],
       ),
-      body: SafeArea(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(12, 4, 12, 12),
-          child: Column(
+    );
+  }
+
+  // ---------- タブ2：スタッツ・履歴 ----------
+  Widget _buildStatsTab() {
+    return ListView(
+      padding: const EdgeInsets.all(12),
+      children: [
+        _buildInfoCard(),
+        const SizedBox(height: 10),
+        _buildStatsTable(),
+        const SizedBox(height: 10),
+        _buildPointLog(),
+      ],
+    );
+  }
+
+  // ============================================================
+  // 入力タブの部品
+  // ============================================================
+
+  Widget _buildCloudBanner() {
+    if (_matchId == null) return const SizedBox.shrink();
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 4),
+      padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 10),
+      decoration: BoxDecoration(
+        color: _readOnly ? Colors.amber.shade100 : Colors.green.shade100,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Text(
+        _readOnly ? '閲覧中（読み取り専用）　コード: $_matchId' : '入力中（クラウド同期）　コード: $_matchId',
+        textAlign: TextAlign.center,
+        style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+      ),
+    );
+  }
+
+  /// 1行の試合情報（タップで編集）
+  Widget _buildInfoHeader() {
+    final i = _info;
+    if (i.isEmpty && _readOnly) return const SizedBox.shrink();
+
+    final text = [
+      if (i.title.isNotEmpty) i.title,
+      if (i.dateText.isNotEmpty) i.dateText,
+      if (i.venue.isNotEmpty) i.venue,
+    ].join('　');
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: _readOnly ? null : _editSetup,
+        child: Container(
+          width: double.infinity,
+          padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 10),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.grey.shade300),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              _buildCloudBanner(),
-              _buildInfoHeader(),
-              _buildGameCount(),
-              _buildGameHistory(),
-              const SizedBox(height: 4),
-              _buildPoints(),
-              const SizedBox(height: 8),
-              _buildServeButtons(),
-              const SizedBox(height: 8),
-              _buildPlayerButtons(),
-              const SizedBox(height: 8),
-              _buildUtilButtons(),
-              const SizedBox(height: 12),
-              _buildStatsTable(),
+              if (!_readOnly)
+                Icon(Icons.edit_note, size: 16, color: Colors.grey.shade600),
+              if (!_readOnly) const SizedBox(width: 4),
+              Flexible(
+                child: Text(
+                  text.isEmpty ? '試合情報・ペア名を入力' : text,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: text.isEmpty
+                        ? FontWeight.normal
+                        : FontWeight.bold,
+                    color: text.isEmpty ? Colors.grey.shade600 : Colors.black87,
+                  ),
+                ),
+              ),
             ],
           ),
         ),
@@ -483,7 +714,6 @@ class _ScoreScreenState extends State<ScoreScreen> {
     );
   }
 
-  // ---------- ゲームカウント ----------
   Widget _buildGameCount() {
     final s = _state;
     final String caption = s.isOver
@@ -496,8 +726,9 @@ class _ScoreScreenState extends State<ScoreScreen> {
       children: [
         Text(
           caption,
+          textAlign: TextAlign.center,
           style: TextStyle(
-            fontSize: 14,
+            fontSize: 12,
             fontWeight: FontWeight.bold,
             color: s.isOver || s.isFinalGame
                 ? Colors.orange.shade800
@@ -509,7 +740,7 @@ class _ScoreScreenState extends State<ScoreScreen> {
             _teamHead(Team.a, _colorA),
             Text(
               '${s.gamesA} - ${s.gamesB}',
-              style: const TextStyle(fontSize: 44, fontWeight: FontWeight.w900),
+              style: const TextStyle(fontSize: 38, fontWeight: FontWeight.w900),
             ),
             _teamHead(Team.b, _colorB),
           ],
@@ -537,7 +768,7 @@ class _ScoreScreenState extends State<ScoreScreen> {
             maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: TextStyle(
-              fontSize: 15,
+              fontSize: 14,
               fontWeight: FontWeight.bold,
               color: color,
             ),
@@ -547,28 +778,27 @@ class _ScoreScreenState extends State<ScoreScreen> {
     );
   }
 
-  // ---------- 終了済みゲームの一覧 ----------
   Widget _buildGameHistory() {
     final list = _state.gameResults;
-    if (list.isEmpty) return const SizedBox(height: 4);
+    if (list.isEmpty) return const SizedBox(height: 2);
 
     return SizedBox(
-      height: 32,
+      height: 30,
       child: ListView(
         scrollDirection: Axis.horizontal,
         children: [
           for (final g in list)
             Container(
-              margin: const EdgeInsets.only(right: 6),
+              margin: const EdgeInsets.only(right: 6, top: 2, bottom: 2),
               padding: const EdgeInsets.symmetric(horizontal: 10),
               alignment: Alignment.center,
               decoration: BoxDecoration(
                 color: Colors.grey.shade200,
-                borderRadius: BorderRadius.circular(16),
+                borderRadius: BorderRadius.circular(14),
               ),
               child: Text.rich(
                 TextSpan(
-                  style: const TextStyle(fontSize: 13),
+                  style: const TextStyle(fontSize: 12),
                   children: [
                     TextSpan(text: g.isFinal ? 'F ' : 'G${g.gameNumber} '),
                     TextSpan(
@@ -599,7 +829,6 @@ class _ScoreScreenState extends State<ScoreScreen> {
     );
   }
 
-  // ---------- 現在のポイント＋サーバー表示 ----------
   Widget _buildPoints() {
     final s = _state;
     final (la, lb) = TennisRule.pointLabel(s.pointsA, s.pointsB, s.isFinalGame);
@@ -618,18 +847,20 @@ class _ScoreScreenState extends State<ScoreScreen> {
         child: Column(
           children: [
             Container(
-              height: 28,
+              height: 24,
               padding: const EdgeInsets.symmetric(horizontal: 12),
               alignment: Alignment.center,
               decoration: BoxDecoration(
                 color: isServerSide ? _teamColor(t) : Colors.transparent,
-                borderRadius: BorderRadius.circular(14),
+                borderRadius: BorderRadius.circular(12),
               ),
               child: Text(
                 isServerSide ? '● ${_names.of(server)}' : '',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
                 style: const TextStyle(
                   color: Colors.white,
-                  fontSize: 14,
+                  fontSize: 13,
                   fontWeight: FontWeight.bold,
                 ),
               ),
@@ -638,7 +869,7 @@ class _ScoreScreenState extends State<ScoreScreen> {
               child: Text(
                 label,
                 style: TextStyle(
-                  fontSize: 88,
+                  fontSize: 72,
                   fontWeight: FontWeight.w900,
                   color: _teamColor(t),
                 ),
@@ -652,24 +883,23 @@ class _ScoreScreenState extends State<ScoreScreen> {
     return Column(
       children: [
         Row(
-          crossAxisAlignment: CrossAxisAlignment.center,
           children: [
             side(Team.a, la),
             const Text(
               '-',
-              style: TextStyle(fontSize: 52, color: Colors.black45),
+              style: TextStyle(fontSize: 44, color: Colors.black45),
             ),
             side(Team.b, lb),
           ],
         ),
         SizedBox(
-          height: 26,
+          height: 22,
           child: note == null
               ? null
               : Text(
                   note,
                   style: TextStyle(
-                    fontSize: 16,
+                    fontSize: 15,
                     fontWeight: FontWeight.bold,
                     color: Colors.orange.shade800,
                   ),
@@ -679,7 +909,6 @@ class _ScoreScreenState extends State<ScoreScreen> {
     );
   }
 
-  // ---------- 1stサーブ イン / フォルト ----------
   Widget _buildServeButtons() {
     final s = _state;
     final server = TennisRule.currentServer(s);
@@ -688,7 +917,7 @@ class _ScoreScreenState extends State<ScoreScreen> {
     Widget btn(String label, Color color, ServeResult r) {
       return Expanded(
         child: SizedBox(
-          height: 60,
+          height: 52,
           child: FilledButton(
             style: FilledButton.styleFrom(
               backgroundColor: color,
@@ -700,7 +929,7 @@ class _ScoreScreenState extends State<ScoreScreen> {
             onPressed: enabled ? () => _serve(r) : null,
             child: Text(
               label,
-              style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold),
+              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
           ),
         ),
@@ -712,7 +941,7 @@ class _ScoreScreenState extends State<ScoreScreen> {
       caption = '';
     } else if (s.firstServeRecorded) {
       final r = s.pendingFirstServe == ServeResult.firstIn ? 'イン' : 'フォルト';
-      caption = '${_names.of(server)}の1st：$r（記録済み）→ 得点を入力してください';
+      caption = '${_names.of(server)}の1st：$r → 得点を入力してください';
     } else {
       caption = '${_names.of(server)}の1stサーブは？（任意）';
     }
@@ -720,7 +949,7 @@ class _ScoreScreenState extends State<ScoreScreen> {
     return Column(
       children: [
         SizedBox(
-          height: 20,
+          height: 18,
           child: Text(
             caption,
             style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
@@ -737,7 +966,6 @@ class _ScoreScreenState extends State<ScoreScreen> {
     );
   }
 
-  // ---------- 4選手の 得点 / ミス ボタン ----------
   Widget _buildPlayerButtons() {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -754,7 +982,7 @@ class _ScoreScreenState extends State<ScoreScreen> {
     final players = Player.of(t);
 
     return Container(
-      padding: const EdgeInsets.all(8),
+      padding: const EdgeInsets.all(6),
       decoration: BoxDecoration(
         color: color.withAlpha(18),
         borderRadius: BorderRadius.circular(14),
@@ -762,21 +990,9 @@ class _ScoreScreenState extends State<ScoreScreen> {
       ),
       child: Column(
         children: [
-          Text(
-            _names.pair(t),
-            textAlign: TextAlign.center,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: TextStyle(
-              fontSize: 14,
-              fontWeight: FontWeight.bold,
-              color: color,
-            ),
-          ),
-          const SizedBox(height: 6),
           for (var i = 0; i < players.length; i++) ...[
             _playerCard(players[i]),
-            if (i != players.length - 1) const SizedBox(height: 8),
+            if (i != players.length - 1) const SizedBox(height: 6),
           ],
         ],
       ),
@@ -785,6 +1001,7 @@ class _ScoreScreenState extends State<ScoreScreen> {
 
   Widget _playerCard(Player p) {
     final color = _teamColor(p.team);
+    final oppColor = _teamColor(p.team.other);
     final disabled = _locked;
     final isServer = !_state.isOver && TennisRule.currentServer(_state) == p;
 
@@ -800,90 +1017,205 @@ class _ScoreScreenState extends State<ScoreScreen> {
       ),
       child: Column(
         children: [
-          Text(
-            '${p.label}選手${isServer ? '  ● サーブ' : ''}',
-            style: TextStyle(
-              fontSize: 14,
-              fontWeight: FontWeight.bold,
-              color: isServer ? color : Colors.black87,
-            ),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Flexible(
+                child: Text(
+                  _names.of(p),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.bold,
+                    color: isServer ? color : Colors.black87,
+                  ),
+                ),
+              ),
+              if (isServer)
+                Text(
+                  ' ● サーブ',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    color: color,
+                  ),
+                ),
+            ],
           ),
-          const SizedBox(height: 6),
-          SizedBox(
-            width: double.infinity,
-            height: 64,
-            child: FilledButton(
-              style: FilledButton.styleFrom(
-                backgroundColor: color,
-                disabledBackgroundColor: Colors.grey.shade400,
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10),
+          const SizedBox(height: 4),
+          Row(
+            children: [
+              Expanded(
+                flex: 3,
+                child: SizedBox(
+                  height: 52,
+                  child: FilledButton(
+                    style: FilledButton.styleFrom(
+                      backgroundColor: color,
+                      disabledBackgroundColor: Colors.grey.shade400,
+                      padding: EdgeInsets.zero,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                    onPressed: disabled ? null : () => _score(p),
+                    child: const Text(
+                      '得点+1',
+                      style: TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w900,
+                      ),
+                    ),
+                  ),
                 ),
               ),
-              onPressed: disabled ? null : () => _score(p),
-              child: const Text(
-                '得点 +1',
-                style: TextStyle(fontSize: 20, fontWeight: FontWeight.w900),
-              ),
-            ),
-          ),
-          const SizedBox(height: 6),
-          SizedBox(
-            width: double.infinity,
-            height: 40,
-            child: OutlinedButton(
-              style: OutlinedButton.styleFrom(
-                foregroundColor: _teamColor(p.team.other),
-                side: BorderSide(
-                  color: _teamColor(p.team.other).withAlpha(180),
+              const SizedBox(width: 5),
+              Expanded(
+                flex: 2,
+                child: SizedBox(
+                  height: 52,
+                  child: OutlinedButton(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: oppColor,
+                      side: BorderSide(color: oppColor.withAlpha(180)),
+                      padding: EdgeInsets.zero,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                    onPressed: disabled ? null : () => _miss(p),
+                    child: const Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          'ミス',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        Text('相手+1', style: TextStyle(fontSize: 10)),
+                      ],
+                    ),
+                  ),
                 ),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(10),
-                ),
               ),
-              onPressed: disabled ? null : () => _miss(p),
-              child: const Text(
-                'ミス（相手に+1）',
-                style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-              ),
-            ),
+            ],
           ),
         ],
       ),
     );
   }
 
-  // ---------- Undo / リセット ----------
   Widget _buildUtilButtons() {
+    const pad = EdgeInsets.symmetric(horizontal: 6);
+    const size = Size.fromHeight(44);
+    const label = TextStyle(fontSize: 13);
+    final highlightNext = _state.isOver && !_readOnly; // 試合終了後は目立たせる
+
+    final nextLabel = const Text('次の試合へ', style: label);
+    const nextIcon = Icon(Icons.skip_next, size: 18);
+    final VoidCallback? nextTap = _readOnly ? null : _nextMatch;
+
     return Row(
       children: [
         Expanded(
           child: OutlinedButton.icon(
-            style: OutlinedButton.styleFrom(
-              minimumSize: const Size.fromHeight(48),
-            ),
+            style: OutlinedButton.styleFrom(minimumSize: size, padding: pad),
             onPressed: (_readOnly || _undoStack.isEmpty) ? null : _undo,
-            icon: const Icon(Icons.undo),
-            label: const Text('1つ戻す'),
+            icon: const Icon(Icons.undo, size: 18),
+            label: const Text('1つ戻す', style: label),
           ),
         ),
-        const SizedBox(width: 10),
+        const SizedBox(width: 6),
+        Expanded(
+          child: highlightNext
+              ? FilledButton.icon(
+                  style: FilledButton.styleFrom(
+                    minimumSize: size,
+                    padding: pad,
+                  ),
+                  onPressed: nextTap,
+                  icon: nextIcon,
+                  label: nextLabel,
+                )
+              : OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    minimumSize: size,
+                    padding: pad,
+                  ),
+                  onPressed: nextTap,
+                  icon: nextIcon,
+                  label: nextLabel,
+                ),
+        ),
+        const SizedBox(width: 6),
         Expanded(
           child: OutlinedButton.icon(
             style: OutlinedButton.styleFrom(
-              minimumSize: const Size.fromHeight(48),
+              minimumSize: size,
+              padding: pad,
               foregroundColor: Colors.red.shade700,
             ),
             onPressed: _readOnly ? null : _confirmReset,
-            icon: const Icon(Icons.restart_alt),
-            label: const Text('リセット'),
+            icon: const Icon(Icons.restart_alt, size: 18),
+            label: const Text('リセット', style: label),
           ),
         ),
       ],
     );
   }
 
-  // ---------- 選手別スタッツ ----------
+  // ============================================================
+  // スタッツタブの部品
+  // ============================================================
+
+  Widget _buildInfoCard() {
+    final i = _info;
+    final where = [
+      if (i.dateText.isNotEmpty) i.dateText,
+      if (i.venue.isNotEmpty) i.venue,
+    ].join('　');
+
+    return Card(
+      elevation: 2,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (i.title.isNotEmpty)
+              Text(
+                i.title,
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            if (where.isNotEmpty)
+              Text(where, style: const TextStyle(fontSize: 12)),
+            if (i.note.isNotEmpty)
+              Text(
+                'メモ：${i.note}',
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+              ),
+            if (!i.isEmpty) const SizedBox(height: 6),
+            Text(
+              '${_names.pair(Team.a)}  vs  ${_names.pair(Team.b)}',
+              style: const TextStyle(fontSize: 13),
+            ),
+            Text(
+              'ゲームカウント ${_state.gamesA} - ${_state.gamesB}'
+              '${_state.isOver ? '（試合終了）' : ''}',
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildStatsTable() {
     Widget cell(
       String t, {
@@ -906,7 +1238,6 @@ class _ScoreScreenState extends State<ScoreScreen> {
 
     String pct(double? v) => v == null ? '--%' : '${(v * 100).round()}%';
 
-    // 得点 − 失点 の表示（プラスは + を付ける）
     String diffText(PlayerStats st) {
       final d = st.winners - st.errors;
       return d > 0 ? '+$d' : '$d';
@@ -1009,6 +1340,132 @@ class _ScoreScreenState extends State<ScoreScreen> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildPointLog() {
+    final pts = _state.points;
+    const maxShown = 60;
+    final shown = pts.reversed.take(maxShown).toList();
+
+    return Card(
+      elevation: 2,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Text(
+                  'ポイントの流れ',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+                ),
+                const Spacer(),
+                Text(
+                  '${pts.length}ポイント（新しい順）',
+                  style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (pts.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: Center(
+                  child: Text(
+                    'まだポイントがありません',
+                    style: TextStyle(color: Colors.grey.shade600),
+                  ),
+                ),
+              )
+            else ...[
+              for (final r in shown) _logTile(r),
+              if (pts.length > maxShown)
+                Padding(
+                  padding: const EdgeInsets.only(top: 8),
+                  child: Text(
+                    '…ほか${pts.length - maxShown}ポイント',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+                  ),
+                ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _logTile(PointRecord r) {
+    final first = switch (r.firstServe) {
+      ServeResult.firstIn => '1stイン',
+      ServeResult.firstFault => '1stフォルト',
+      null => '1st未入力',
+    };
+    final isWin = r.kind == PointKind.winner;
+    // 7ゲーム目は、必ずファイナルゲーム
+    final gameLabel = r.gameNumber == 7 ? 'F' : 'G${r.gameNumber}';
+
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      decoration: BoxDecoration(
+        border: Border(top: BorderSide(color: Colors.grey.shade200)),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 34,
+            child: Text(
+              gameLabel,
+              style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+            ),
+          ),
+          Container(
+            width: 10,
+            height: 10,
+            margin: const EdgeInsets.only(right: 6, top: 4),
+            decoration: BoxDecoration(
+              color: _teamColor(r.winnerTeam), // ポイントを取った側の色
+              shape: BoxShape.circle,
+            ),
+          ),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text.rich(
+                  TextSpan(
+                    children: [
+                      TextSpan(
+                        text: _names.of(r.actor),
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: _teamColor(r.actor.team),
+                        ),
+                      ),
+                      TextSpan(
+                        text: isWin ? ' 得点' : ' ミス',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          color: isWin
+                              ? Colors.green.shade800
+                              : Colors.red.shade700,
+                        ),
+                      ),
+                    ],
+                  ),
+                  style: const TextStyle(fontSize: 14),
+                ),
+                Text(
+                  'サーブ：${_names.of(r.server)}（$first）',
+                  style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

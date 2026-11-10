@@ -1,12 +1,12 @@
 {
-    "name": "score_sheet_app",
-    "short_name": "score_sheet_app",
+    "name": "スコアシート",
+    "short_name": "スコアシート",
+    "description": "ソフトテニス リアルタイム スコア管理＆スタッツ集計",
     "start_url": ".",
     "display": "standalone",
-    "background_color": "#0175C2",
-    "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
     "orientation": "portrait-primary",
+    "background_color": "#F4F7F2",
+    "theme_color": "#2E7D32",
     "prefer_related_applications": false,
     "icons": [
         {
