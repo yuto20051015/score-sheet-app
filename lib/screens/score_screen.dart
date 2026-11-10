@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'club_list_screen.dart';
 import '../models/match_info.dart';
 import '../data/match_repository.dart';
 import '../models/player_names.dart';
@@ -169,6 +170,12 @@ class _ScoreScreenState extends State<ScoreScreen> {
               subtitle: const Text('他人の試合は閲覧のみ／自分の試合は入力を再開'),
               onTap: () => Navigator.pop(ctx, 'join'),
             ),
+            ListTile(
+              leading: const Icon(Icons.list_alt),
+              title: const Text('試合一覧（部活アカウント）'),
+              subtitle: const Text('ログインした人だけが一覧を見られます'),
+              onTap: () => Navigator.pop(ctx, 'club'),
+            ),
             if (_matchId != null)
               ListTile(
                 leading: const Icon(Icons.cloud_off),
@@ -186,6 +193,8 @@ class _ScoreScreenState extends State<ScoreScreen> {
         await _joinCloudMatch();
       case 'leave':
         _disconnect();
+      case 'club':
+        await _openClubList();
     }
   }
 
@@ -211,7 +220,20 @@ class _ScoreScreenState extends State<ScoreScreen> {
       builder: (_) => const JoinCodeDialog(),
     );
     if (code == null || code.isEmpty) return;
+    await _joinWithCode(code);
+  }
 
+  /// 一覧画面を開き、選ばれた試合に参加する
+  Future<void> _openClubList() async {
+    final code = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(builder: (_) => const ClubListScreen()),
+    );
+    if (code == null || !mounted) return;
+    await _joinWithCode(code);
+  }
+
+  Future<void> _joinWithCode(String code) async {
     try {
       final snap = await _repo.fetch(code);
       if (!mounted) return;

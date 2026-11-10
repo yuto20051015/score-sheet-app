@@ -60,24 +60,8 @@ class FirestoreMatchRepository {
     'updatedAt': FieldValue.serverTimestamp(),
   };
 
-  MatchSnapshot? _parse(DocumentSnapshot<Map<String, dynamic>> d) {
-    final data = d.data();
-    if (data == null) return null;
-    final st = data['state'];
-    if (st is! Map) return null;
-    final names = data['names'];
-    final info = data['info'];
-    return MatchSnapshot(
-      state: MatchCodec.decodeState(Map<String, dynamic>.from(st)),
-      names: PlayerNames.fromMap(
-        names is Map ? Map<String, dynamic>.from(names) : null,
-      ),
-      info: MatchInfo.fromMap(
-        info is Map ? Map<String, dynamic>.from(info) : null,
-      ),
-      ownerUid: data['ownerUid'] as String? ?? '',
-    );
-  }
+  MatchSnapshot? _parse(DocumentSnapshot<Map<String, dynamic>> d) =>
+      parseMatchData(d.data());
 
   /// 新しい試合を作成し、試合コードを返す（初回のみ通信が必要）
   Future<String> createMatch(
@@ -122,4 +106,23 @@ class FirestoreMatchRepository {
   /// リアルタイム購読（閲覧側用）
   Stream<MatchSnapshot?> watch(String matchId) =>
       _doc(matchId).snapshots().map(_parse);
+}
+
+/// Firestore のドキュメントの中身 → MatchSnapshot（一覧画面でも使う）
+MatchSnapshot? parseMatchData(Map<String, dynamic>? data) {
+  if (data == null) return null;
+  final st = data['state'];
+  if (st is! Map) return null;
+  final names = data['names'];
+  final info = data['info'];
+  return MatchSnapshot(
+    state: MatchCodec.decodeState(Map<String, dynamic>.from(st)),
+    names: PlayerNames.fromMap(
+      names is Map ? Map<String, dynamic>.from(names) : null,
+    ),
+    info: MatchInfo.fromMap(
+      info is Map ? Map<String, dynamic>.from(info) : null,
+    ),
+    ownerUid: data['ownerUid'] as String? ?? '',
+  );
 }
